@@ -1,0 +1,172 @@
+ollama:
+  protocol: "http"     # Can be "http" or "https"
+  host: "localhost"    # Can be changed to remote IP
+  port: 11434         # Default Ollama port
+  timeout: 30         # Timeout in seconds
+  retries: 3          # Number of retries for failed requests
+
+# MongoDB Configuration
+mongodb:
+  uri: "mongodb://localhost:27017/"
+  db_name: "AirflowDb"
+  collection_name: "DagTaskLogs"
+  # Connection options
+  timeout_ms: 5000
+  max_pool_size: 50
+  retry_writes: true
+  # Query settings
+  batch_size: 1000
+  max_time_ms: 30000
+
+# Log Analysis Configuration
+analysis:
+  # Number of days of logs to analyze
+  days_back: 2
+  # Minimum occurrences to consider a pattern significant
+  min_pattern_occurrences: 1
+  # Maximum lines of context around errors/warnings
+  context_lines: 3
+  
+  # Pattern matching settings
+  patterns:
+    airflow_context:
+      regex: "AIRFLOW_CTX_DAG_OWNER='([^']+)'\\s*AIRFLOW_CTX_DAG_ID='([^']+)'\\s*AIRFLOW_CTX_TASK_ID='([^']+)'\\s*AIRFLOW_CTX_EXECUTION_DATE='([^']+)'\\s*AIRFLOW_CTX_TRY_NUMBER='([^']+)'\\s*AIRFLOW_CTX_DAG_RUN_ID='([^']+)'"
+      severity: "info"
+      include_context: false
+
+    error:
+      regex: "ERROR -.*|ERROR|Exception|Failed|Failure"
+      severity: "high"
+      include_context: true
+    
+    warning:
+      regex: "WARNING -.*"
+      severity: "medium"
+      include_context: true
+
+    test_failure:
+      regex: "Failure in test[^\\n]*?(?:models|tests)/[^\\n]*\\.yml"
+      severity: "high"
+      include_context: true
+    
+    task_state:
+      regex: "\\[([^\\]]+)\\] Task (.*) is in state ([A-Z]+)"
+      severity: "info"
+      include_context: false
+    
+    pod_status:
+      regex: "Pod (.*) (has phase|returned) ([A-Za-z]+)"
+      severity: "medium" 
+      include_context: true
+    
+    performance:
+      regex: "(total_duration|load_duration|prompt_eval_count|eval_count): (\\d+)"
+      severity: "low"
+      include_context: false
+
+    dag_run:
+      regex: "DAG run (.*) with trigger (.*) has state (.*)"
+      severity: "medium"
+      include_context: true
+      
+    scheduler:
+      regex: "Scheduler\\s+(.*?)\\s+with\\s+PID"
+      severity: "high"
+      include_context: true
+
+    database:
+      regex: "(postgres|mysql|sqlite).*error"
+      severity: "critical"
+      include_context: true
+
+# Model Configuration
+model:
+  name: "airflow-log-analyzer"
+  base_model: "llama3.2"
+  parameters:
+    temperature: 0.7
+    top_p: 0.8
+    num_ctx: 4096
+
+  creation:
+    force_recreate: true  # Always recreate model even if it exists
+    prompt_for_recreate: true  # Ask user before recreating
+    skip_if_exists: false  # Skip creation if model exists    
+  
+  # System prompt template sections
+  prompt_sections:
+    - name: "Error Patterns"
+      description: "Common error patterns and their frequencies"
+      include_examples: true
+      max_examples: 3
+      
+    - name: "Warning Patterns"
+      description: "Warning messages and their context"
+      include_examples: true
+      max_examples: 3
+      
+    - name: "Task States"
+      description: "Task state transitions and timing"
+      include_examples: false
+      
+    - name: "Test Results"
+      description: "Analysis of test outcomes"
+      include_examples: true
+      max_examples: 2
+      
+    - name: "Pod Status"
+      description: "Container/Pod lifecycle patterns"
+      include_examples: true
+      max_examples: 2
+      
+    - name: "Performance"
+      description: "Performance metrics and trends"
+      include_examples: false
+
+# Logging Configuration
+logging:
+  version: 1
+  disable_existing_loggers: false
+  
+  formatters:
+    standard:
+      format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+      datefmt: '%Y-%m-%d %H:%M:%S'
+  
+  handlers:
+    console:
+      class: logging.StreamHandler
+      level: DEBUG  # Change this from INFO to DEBUG
+      formatter: standard
+      stream: ext://sys.stdout
+    
+    file:
+      class: logging.FileHandler
+      level: DEBUG  # Change this from INFO to DEBUG
+      formatter: standard
+      filename: 'airflow_log_analyzer.log'
+      mode: 'a'
+  
+  loggers:
+    airflow_log_analyzer:
+      level: DEBUG  # Change this from INFO to DEBUG
+      handlers: [console, file]
+      propagate: false
+
+# Output Configuration      
+output:
+  # Save analysis results
+  save_analysis: true
+  analysis_file: "analysis_results.json"
+  
+  # Save generated system prompt
+  save_prompt: true
+  prompt_file: "system_prompt.txt"
+  
+  # Save Ollama model request
+  save_model_request: true
+  model_request_file: "model_request.json"
+  
+  # Format options
+  json_indent: 2
+  include_timestamp: true

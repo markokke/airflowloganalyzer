@@ -1,9 +1,9 @@
-# clients/ollama_client.py
 import json
 from datetime import datetime
 import time
 import requests
 import logging
+from pathlib import Path
 from typing import Dict, Union
 from prompts import (
     AIRFLOW_LOG_ANALYSIS_PROMPT,
@@ -19,14 +19,8 @@ class OllamaClient:
     """Client for interacting with Ollama API for model management and inference."""
     
     def __init__(self, model_name: str, config: Dict):
-        """
-        Initialize the Ollama client.
-        
-        Args:
-            model_name: Name of the model to use
-            config: Configuration dictionary containing Ollama settings
-        """
         self.config = config['ollama']
+        self.output_config = config['output']  # Add this line
         protocol = self.config.get('protocol', 'http')
         host = self.config['host']
         port = self.config['port']
@@ -173,7 +167,7 @@ class OllamaClient:
             print(f"Error generating completion: {str(e)}")
             raise
         
-    def ask_model(self, log_content: str, prompt_type: str = 'main') -> Dict:
+    def ask_model(self, log_content: str, prompt_type: str = 'main', log_id: str = None) -> Dict:
         """Ask the model to analyze log content using a specific prompt type."""
         if prompt_type not in self.prompts:
             raise ValueError(f"Invalid prompt type: {prompt_type}")
@@ -181,12 +175,23 @@ class OllamaClient:
         prompt_template = self.prompts[prompt_type]
         formatted_prompt = self._format_prompt(prompt_template, log_content, prompt_type)
         
-        # Write formatted prompt to JSON file
+        self.logger.debug(f"ask_model prompt: {formatted_prompt}")
+        
+        # Create prompt directory if it doesn't exist
+        base_dir = Path(self.output_config['output_dir'])
+        prompts_dir = base_dir / self.output_config['subdirectories']['prompts']
+        prompts_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Write formatted prompt to JSON file in the prompts directory
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        prompt_file = f"prompt_{prompt_type}_{timestamp}.json"
+        # Include log_id in filename if provided
+        log_id_part = f"_{log_id[:8]}" if log_id else ""
+        prompt_file = prompts_dir / f"prompt_{prompt_type}{log_id_part}_{timestamp}.json"
+        
         with open(prompt_file, 'w') as f:
             json.dump({
                 "prompt_type": prompt_type,
+                "log_id": log_id,  # Include log_id in the JSON content too
                 "formatted_prompt": formatted_prompt
             }, f, indent=2)
         

@@ -1,6 +1,6 @@
 ollama:
   protocol: "http"     # Can be "http" or "https"
-  host: "localhost"    # Can be changed to remote IP
+  host: "192.168.1.3"    # Can be changed to remote IP
   port: 11434         # Default Ollama port
   timeout: 30         # Timeout in seconds
   retries: 3          # Number of retries for failed requests
@@ -9,7 +9,10 @@ ollama:
 mongodb:
   uri: "mongodb://localhost:27017/"
   db_name: "AirflowDb"
-  collection_name: "DagTaskLogs"
+  collection_name: "DagTaskLogs"  # Keep for backward compatibility
+  collections:
+    logs: "DagTaskLogs"
+    analysis: "AirflowLogAnalysis"
   # Connection options
   timeout_ms: 5000
   max_pool_size: 50
@@ -17,6 +20,18 @@ mongodb:
   # Query settings
   batch_size: 1000
   max_time_ms: 30000
+  # Index settings for analysis collection
+  analysis_indexes:
+    - field: "dag_id"
+      direction: 1
+    - field: "dag_run_id"
+      direction: 1
+    - field: "task_id"
+      direction: 1
+    - field: "try_number"
+      direction: 1
+    - field: "timestamp"
+      direction: -1
 
 # Log Analysis Configuration
 analysis:
@@ -153,20 +168,17 @@ logging:
       handlers: [console, file]
       propagate: false
 
-# Output Configuration      
 output:
-  # Save analysis results
+  output_dir: "F:/reports"
+  subdirectories:
+    reports: "reports"
+    json: "json"
+    prompts: "prompts" 
   save_analysis: true
   analysis_file: "analysis_results.json"
-  
-  # Save generated system prompt
   save_prompt: true
   prompt_file: "system_prompt.txt"
-  
-  # Save Ollama model request
   save_model_request: true
   model_request_file: "model_request.json"
-  
-  # Format options
   json_indent: 2
   include_timestamp: true

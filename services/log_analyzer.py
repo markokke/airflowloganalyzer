@@ -1,8 +1,8 @@
 import yaml
 import json
 import logging.config
-from collections import defaultdict
 import re
+from collections import defaultdict
 from typing import Dict, List
 import pymongo
 from datetime import datetime, timedelta
@@ -10,7 +10,9 @@ from bson.objectid import ObjectId
 from pathlib import Path
 from prompts import AIRFLOW_LOG_ANALYSIS_PROMPT
 from models.mongo_encoder import MongoJSONEncoder 
+from models.mongodb_operations import MongoDBOperations
 from clients.ollama_client import OllamaClient
+from services.report_generator import ReportGenerator
 
 class LogAnalyzer:
     def __init__(self, config: Dict):
@@ -18,7 +20,10 @@ class LogAnalyzer:
         self.config = config
         logging.config.dictConfig(self.config['logging'])
         self.logger = logging.getLogger('airflow_log_analyzer')
-        self.init_mongodb()
+        
+        # Initialize MongoDB connections
+        self._init_mongodb()
+        self.mongo_ops = MongoDBOperations(self.db)
         
         # Add error checking for patterns
         if 'analysis' not in self.config:
@@ -44,12 +49,8 @@ class LogAnalyzer:
             
         self.analysis_results = {}
 
-    def _load_config(self, config_path: str) -> Dict:
-        with open(config_path) as f:
-            return yaml.safe_load(f)
-            
-    def init_mongodb(self):
-        """Initialize MongoDB connection with better error handling."""
+    def _init_mongodb(self):
+        """Initialize MongoDB connections with better error handling."""
         mongo_config = self.config.get('mongodb')
         if not mongo_config:
             raise ValueError("MongoDB configuration is missing from config")
@@ -57,6 +58,7 @@ class LogAnalyzer:
         try:
             self.logger.debug(f"Attempting to connect to MongoDB at {mongo_config['uri']}")
             
+            # Initialize main MongoDB client
             self.client = pymongo.MongoClient(
                 mongo_config['uri'],
                 serverSelectionTimeoutMS=mongo_config['timeout_ms'],
@@ -67,16 +69,41 @@ class LogAnalyzer:
             self.client.server_info()
             self.logger.info("Successfully connected to MongoDB")
             
-            # Get database and collection
+            # Get database
             self.db = self.client[mongo_config['db_name']]
-            self.collection = self.db[mongo_config['collection_name']]
             
-            # Verify collection exists and has documents
-            doc_count = self.collection.count_documents({})
-            self.logger.info(f"Found {doc_count} documents in collection {mongo_config['collection_name']}")
+            # Initialize collections - with fallback to old configuration style
+            if 'collections' in mongo_config:
+                # New style configuration
+                collections_config = mongo_config['collections']
+                self.log_collection = self.db[collections_config['logs']]
+                self.analysis_collection = self.db[collections_config['analysis']]
+            else:
+                # Old style configuration
+                self.log_collection = self.db[mongo_config['collection_name']]
+                self.analysis_collection = self.db['AirflowLogAnalysis']
+            
+            # Default index configuration
+            default_indexes = [
+                {'field': 'dag_id', 'direction': 1},
+                {'field': 'dag_run_id', 'direction': 1},
+                {'field': 'task_id', 'direction': 1},
+                {'field': 'try_number', 'direction': 1},
+                {'field': 'timestamp', 'direction': -1}
+            ]
+            
+            # Get index configuration or use defaults
+            index_config = mongo_config.get('analysis_indexes', default_indexes)
+            
+            # Create indexes
+            self._ensure_analysis_indexes(index_config)
+            
+            # Verify log collection exists and has documents
+            doc_count = self.log_collection.count_documents({})
+            self.logger.info(f"Found {doc_count} documents in logs collection")
             
             if doc_count == 0:
-                self.logger.warning(f"Collection {mongo_config['collection_name']} is empty")
+                self.logger.warning("Logs collection is empty")
                 
         except pymongo.errors.ServerSelectionTimeoutError as e:
             self.logger.error(f"Could not connect to MongoDB server: {str(e)}")
@@ -87,198 +114,210 @@ class LogAnalyzer:
         except Exception as e:
             self.logger.error(f"Failed to initialize MongoDB: {str(e)}")
             raise
-        
-    def analyze_logs(self) -> Dict:
-        """Primary analysis method returning pattern results."""
-        # Add error checking for config
-        if 'analysis' not in self.config:
-            self.logger.error("Missing 'analysis' section in configuration")
-            raise KeyError("Missing 'analysis' section in configuration")
-        if 'days_back' not in self.config['analysis']:
-            self.logger.error("Missing 'days_back' in analysis configuration")
-            raise KeyError("Missing 'days_back' in analysis configuration")
 
-        days_back = self.config['analysis']['days_back']
-        cutoff_date = datetime.now() - timedelta(days=days_back)
-        cutoff_object_id = ObjectId.from_datetime(cutoff_date)
-        
-        self.logger.info(f"Analyzing logs from the last {days_back} days")
-        
-        # Count total logs
-        total_logs = self.collection.count_documents({"_id": {"$gte": cutoff_object_id}})
-        self.logger.info(f"Found {total_logs} log entries to analyze")
-        
-        # Query logs
-        logs = self.collection.find(
-            {"_id": {"$gte": cutoff_object_id}},
-            batch_size=self.config['mongodb']['batch_size']
-        )
-        
-        # Add this debug statement
-        #first_doc = self.collection.find_one({"_id": {"$gte": cutoff_object_id}})
-        #if first_doc:
-        #    self.logger.debug("Document structure (without LogInfo):")
-        #    doc_without_loginfo = {k: v for k, v in first_doc.items() if k != 'LogInfo'}
-        #    self.logger.debug(json.dumps(doc_without_loginfo, default=str, indent=2))
-        #    self.logger.debug("First 100 characters of LogInfo:")
-        #    loginfo = first_doc.get('LogInfo', 'No LogInfo found')
-        #    self.logger.debug(loginfo[:100] + "..." if len(loginfo) > 100 else loginfo)
-        
-        
-        # Process patterns
-        results = {
-            pattern: defaultdict(list) 
-            for pattern in self.patterns.keys()
-        }
-        
-        # Initialize pattern results dictionary for specific analyses
-        pattern_results = defaultdict(list)
-        
-        processed_logs = 0
-        for log in logs:
-            processed_logs += 1
-            log_info = log['LogInfo']
-            for pattern_name, pattern_config in self.config['analysis']['patterns'].items():
-                # Extract pattern and get the matches
-                matches = self._extract_pattern(
-                    pattern_name,
-                    pattern_config,
-                    log_info,
-                    results[pattern_name]
-                )
+    def _ensure_analysis_indexes(self, index_config: List[Dict]):
+        """Ensure required indexes exist on the analysis collection."""
+        try:
+            existing_indexes = self.analysis_collection.list_indexes()
+            existing_index_names = {idx['name'] for idx in existing_indexes}
+            
+            for index in index_config:
+                field = index['field']
+                direction = index['direction']
+                index_name = f"{field}_1" if direction == 1 else f"{field}_-1"
                 
-                # Group by pattern type using only the matched content
-                if matches and pattern_config.get('severity') in ['critical', 'high']:
-                    pattern_type = self._get_pattern_type(pattern_name)
-                    for match_content in matches:
-                        pattern_results[pattern_type].append({
-                            'content': match_content,  # Only the matched content
-                            'pattern': pattern_name,
-                            'severity': pattern_config.get('severity')
-                        })
-        
-        # Store actual counts
-        self.total_logs = total_logs
-        self.processed_logs = processed_logs
-        
-        # Process regular results
-        self.analysis_results = self._process_results(results)
-        
-        # Initialize Ollama client
-        ollama_client = OllamaClient(model_name=self.config['model']['name'], config=self.config)
-        
-        # Perform specific pattern analyses
-        analysis_results = {}
-        
-        # Error patterns
-        if pattern_results.get('error'):
-            lootatme = pattern_results['error']
-            error_analysis = ollama_client.ask_model(pattern_results['error'], prompt_type='error')
-            analysis_results['error_analysis'] = error_analysis
+                if index_name not in existing_index_names:
+                    self.logger.info(f"Creating index on {field}")
+                    self.analysis_collection.create_index(
+                        [(field, direction)],
+                        background=True
+                    )
+                    self.logger.debug(f"Created index {index_name}")
             
-        # Test failure patterns
-        if pattern_results.get('test_result'):
-            test_analysis = ollama_client.ask_model(pattern_results['test_result'], prompt_type='test')
-            analysis_results['test_analysis'] = test_analysis
-
-        # Performance patterns
-        if pattern_results.get('performance'):
-            perf_analysis = ollama_client.ask_model(pattern_results['performance'], prompt_type='performance')
-            analysis_results['performance_analysis'] = perf_analysis
+            self.logger.info("Finished ensuring analysis collection indexes")
             
-        # Pod status patterns
-        if pattern_results.get('pod_status'):
-            pod_analysis = ollama_client.ask_model(pattern_results['pod_status'], prompt_type='pod')
-            analysis_results['pod_analysis'] = pod_analysis
-            
-        # DBT patterns
-        dbt_patterns = [p for p in pattern_results.keys() if 'dbt' in p.lower()]
-        if dbt_patterns:
-            # Combine all DBT-related pattern matches
-            all_dbt_matches = []
-            for pattern in dbt_patterns:
-                all_dbt_matches.extend(pattern_results[pattern])
-            dbt_analysis = ollama_client.ask_model(all_dbt_matches, prompt_type='dbt')
-            analysis_results['dbt_analysis'] = dbt_analysis
-
-        # Add debug log for pattern results before analysis
-        self.logger.debug("Pattern matches found:")
-        for pattern_type, matches in pattern_results.items():
-            self.logger.debug(f"{pattern_type}: {len(matches)} matches")
+        except Exception as e:
+            self.logger.error(f"Error ensuring analysis indexes: {str(e)}")
+            raise
         
-        # Store all results
-        self.pattern_analysis = analysis_results
-        
-        # Before the return statement
-        final_results = {
-            'pattern_matches': self.analysis_results,
-            'prompt_analysis': analysis_results,
-            'counts': {
-                'total_logs': total_logs,
-                'processed_logs': processed_logs,
-                'pattern_matches': sum(
-                    len(severity_data)
-                    for pattern_data in self.analysis_results.values()
-                    if isinstance(pattern_data, dict)
-                    for severity_data in pattern_data.values()
-                    if isinstance(severity_data, list)
-                )
-            }
-        }
-        
-        self.logger.debug("Final results summary:")
-        self.logger.debug(f"- Pattern matches: {len(self.analysis_results)}")
-        self.logger.debug(f"- Prompt analyses: {len(analysis_results)}")
-        self.logger.debug(f"- Total logs processed: {processed_logs}")
-        
-        return final_results
-        
-    def _get_pattern_type(self, pattern_name: str) -> str:
-        """
-        Map pattern names to their types for prompt selection.
-        
-        Args:
-            pattern_name: Name of the pattern to categorize
-            
-        Returns:
-            String indicating the pattern type (error, test_result, etc.)
-        """
-        pattern_mappings = {
-            'error': ['error', 'exception', 'failure', 'failed'],
-            'test_result': ['test', 'assertion', 'validate'],
-            'performance': ['performance', 'duration', 'latency', 'timeout'],
-            'pod_status': ['pod', 'container', 'kubernetes'],
-            'dbt': ['dbt', 'data_build', 'model'],
-            'scheduler': ['scheduler', 'scheduling'],
-            'database': ['database', 'postgres', 'mysql', 'sqlite'],
-            'airflow_task': ['task', 'operator'],
-            'dag_run': ['dag', 'run', 'trigger']
-        }
-        
-        pattern_name_lower = pattern_name.lower()
-        
-        # Check each pattern type for matching keywords
-        for pattern_type, keywords in pattern_mappings.items():
-            if any(keyword in pattern_name_lower for keyword in keywords):
-                return pattern_type
+    def analyze_individual_logs(self) -> List[Dict]:
+        """Analyze each log entry individually and return list of analysis results."""
+        try:
+            if 'analysis' not in self.config:
+                self.logger.error("Missing 'analysis' section in configuration")
+                raise KeyError("Missing 'analysis' section in configuration")
                 
-        # If no specific match is found, return 'main' as default
-        return 'main'        
-    
-    def get_log_counts(self) -> Dict[str, int]:
-        """Get counts of logs analyzed and patterns found."""
-        return {
-            'total_logs': getattr(self, 'total_logs', 0),
-            'processed_logs': getattr(self, 'processed_logs', 0),
-            'pattern_matches': sum(
-                len(severity_data)
-                for pattern_data in self.analysis_results.values()
-                if isinstance(pattern_data, dict)
-                for severity_data in pattern_data.values()
-                if isinstance(severity_data, list)
+            days_back = self.config['analysis']['days_back']
+            cutoff_date = datetime.now() - timedelta(days=days_back)
+            cutoff_object_id = ObjectId.from_datetime(cutoff_date)
+            
+            self.logger.info(f"Analyzing individual logs from the last {days_back} days")
+            
+            # Query logs
+            logs = self.log_collection.find(
+                {"_id": {"$gte": cutoff_object_id}},
+                batch_size=self.config['mongodb']['batch_size']
             )
-        }    
-    
+            
+            analysis_results = []
+            ollama_client = OllamaClient(model_name=self.config['model']['name'], config=self.config)
+            report_generator = ReportGenerator(self.config)
+            
+            log_count = 0
+            total_logs = self.log_collection.count_documents({"_id": {"$gte": cutoff_object_id}})
+            self.logger.info(f"Found {total_logs} logs to analyze")
+
+            for log in logs:
+                try:
+                    log_count += 1
+                    log_id = str(log['_id'])
+                    self.logger.info(f"{'='*40}")
+                    self.logger.info(f"Starting analysis of log {log_count} of {total_logs} (ID: {log_id})")
+                    
+                    # Log pattern information for this log entry
+                    self.logger.debug(f"Starting pattern analysis for log {log_id}")
+                    for pattern_name, pattern_config in self.config['analysis']['patterns'].items():
+                        self.logger.debug(f"Checking pattern '{pattern_name}' with regex: {pattern_config['regex']}")
+                    
+                    # Initialize pattern results for this log
+                    pattern_results = defaultdict(list)
+                    
+                    # Process patterns for this single log
+                    log_info = log['LogInfo']
+                    for pattern_name, pattern_config in self.config['analysis']['patterns'].items():
+                        matches = self._extract_pattern(
+                            pattern_name,
+                            pattern_config,
+                            log_info,
+                            defaultdict(list)
+                        )
+                        
+                        if matches:
+                            pattern_type = pattern_name
+                            for match_content in matches:
+                                pattern_results[pattern_type].append({
+                                    'content': match_content,
+                                    'pattern': pattern_name,
+                                    'severity': pattern_config.get('severity')
+                                })
+                            self.logger.debug(f"Found {len(matches)} matches for '{pattern_name}' in log {log_id}")
+                        else:
+                            self.logger.debug(f"No matches found for '{pattern_name}' in log {log_id}")
+
+                    # Perform analysis for this log
+                    log_analysis = {}
+                    
+                    try:
+                        # Test failure patterns
+                        if pattern_results.get('test_failure'):
+                            test_analysis = ollama_client.ask_model(
+                                pattern_results['test_failure'], 
+                                prompt_type='test',
+                                log_id=log_id
+                            )
+                            log_analysis['test_analysis'] = test_analysis
+                            
+                        # Error patterns
+                        if pattern_results.get('error'):
+                            error_analysis = ollama_client.ask_model(
+                                pattern_results['error'], 
+                                prompt_type='error',
+                                log_id=log_id
+                            )
+                            log_analysis['error_analysis'] = error_analysis
+                            
+                        # Performance patterns
+                        if pattern_results.get('performance'):
+                            perf_analysis = ollama_client.ask_model(
+                                pattern_results['performance'], 
+                                prompt_type='performance',
+                                log_id=log_id
+                            )
+                            log_analysis['performance_analysis'] = perf_analysis
+                            
+                        # Pod status patterns
+                        if pattern_results.get('pod_status'):
+                            pod_analysis = ollama_client.ask_model(
+                                pattern_results['pod_status'], 
+                                prompt_type='pod',
+                                log_id=log_id
+                            )
+                            log_analysis['pod_analysis'] = pod_analysis
+
+                    except Exception as e:
+                        self.logger.error(f"Error during Ollama analysis for log {log_id}: {str(e)}")
+
+                    # Get timestamp consistently
+                    log_timestamp = log.get('timestamp', str(log['_id'].generation_time))
+                    
+                    # Format the analysis data
+                    analysis_data = {
+                        'log_id': log_id,
+                        'log_info': log_info,  # Include raw log content
+                        'analysis': log_analysis,
+                        'patterns': dict(pattern_results),
+                        'recommendations': self._generate_recommendations(dict(pattern_results)),
+                        'summary': {
+                            'log_id': log_id,
+                            'timestamp': log_timestamp,
+                            'total_issues_found': sum(len(matches) for matches in pattern_results.values())
+                        }
+                    }
+
+                    # Store in MongoDB Analysis Collection
+                    try:
+                        analysis_id = self.mongo_ops.store_analysis(analysis_data)
+                        self.logger.info(f"Stored analysis in MongoDB with ID: {analysis_id}")
+                    except Exception as e:
+                        self.logger.error(f"Error storing analysis in MongoDB: {str(e)}")
+                        self.logger.exception("MongoDB storage error details:")
+                    
+                    # Generate and save report
+                    try:
+                        # Format and save the report
+                        formatted_report = report_generator.format_analysis(log_analysis, analysis_data)
+                        filename = f"airflow_analysis_log_{log_id}.txt"
+                        report_path = report_generator.save_report(formatted_report, filename)
+                        self.logger.info(f"Generated report for log {log_id}: {report_path}")
+                    except Exception as e:
+                        self.logger.error(f"Error generating report for log {log_id}: {str(e)}")
+                        self.logger.exception("Report generation error details:")
+
+                    # Add to overall results
+                    log_result = {
+                        'log_id': log_id,
+                        'timestamp': log_timestamp,
+                        'pattern_matches': dict(pattern_results),
+                        'analysis': log_analysis
+                    }
+                    analysis_results.append(log_result)
+
+                    if log_count % 10 == 0:
+                        self.logger.info(f"Processed {log_count} of {total_logs} logs")
+                    
+                    self.logger.debug(f"Completed analysis for log {log_id}")
+                    self.logger.info(f"Successfully completed analysis of log {log_count}")
+                    self.logger.info(f"{'='*40}\n")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error processing log {log_count} (ID: {log_id}): {str(e)}")
+                    self.logger.exception("Full traceback:")
+                    # Continue with next log instead of stopping
+                    continue
+
+            self.logger.info(f"{'='*60}")
+            self.logger.info("Final Summary:")
+            self.logger.info(f"Total logs found: {total_logs}")
+            self.logger.info(f"Total logs processed: {log_count}")
+            self.logger.info(f"{'='*60}")
+            
+            return analysis_results
+            
+        except Exception as e:
+            self.logger.error(f"Critical error in analyze_individual_logs: {str(e)}")
+            self.logger.exception("Full traceback:")
+            raise
+        
     def _extract_pattern(self, pattern_name: str, pattern_config: Dict, log_info: str, results: Dict):
         """Extract patterns from log info based on configuration"""
         lines = log_info.split('\n')
@@ -327,7 +366,7 @@ class LogAnalyzer:
             
         return matched_contents
         
-    def _get_context(self, log_info: str, match, context_lines: int) -> str:
+    def _get_context(self, log_info: str, match: re.Match, context_lines: int) -> str:
         """Get surrounding context lines for a match"""
         lines = log_info.split('\n')
         line_num = len(log_info[:match.start()].split('\n'))
@@ -336,308 +375,135 @@ class LogAnalyzer:
         end = min(len(lines), line_num + context_lines + 1)
         
         return '\n'.join(lines[start:end])
+
+    def _get_pattern_type(self, pattern_name: str) -> str:
+        """
+        Map pattern names to their types for prompt selection.
         
-    def _process_results(self, results: Dict) -> Dict:
-        """Process and filter analysis results"""
-        min_occurrences = self.config['analysis']['min_pattern_occurrences']
+        Args:
+            pattern_name: Name of the pattern to categorize
+            
+        Returns:
+            String indicating the pattern type (error, test_result, etc.)
+        """
+        pattern_mappings = {
+            'error': ['error', 'exception', 'failure', 'failed'],
+            'test_result': ['test', 'assertion', 'validate'],
+            'performance': ['performance', 'duration', 'latency', 'timeout'],
+            'pod_status': ['pod', 'container', 'kubernetes'],
+            'dbt': ['dbt', 'data_build', 'model'],
+            'scheduler': ['scheduler', 'scheduling'],
+            'database': ['database', 'postgres', 'mysql', 'sqlite'],
+            'airflow_task': ['task', 'operator'],
+            'dag_run': ['dag', 'run', 'trigger']
+        }
         
-        processed = {}
-        for pattern, pattern_results in results.items():
-            processed[pattern] = {
-                severity: results
-                for severity, results in pattern_results.items()
-                if len(results) >= min_occurrences
-            }
-            if processed[pattern]:
-                # Instead of debug logging, write to JSON file
-                pattern_file = f"pattern_{pattern}_matches.json"
-                with open(pattern_file, 'w') as f:
-                    json.dump(processed[pattern], f, indent=2, cls=MongoJSONEncoder)
+        pattern_name_lower = pattern_name.lower()
+        
+        # Check each pattern type for matching keywords
+        for pattern_type, keywords in pattern_mappings.items():
+            if any(keyword in pattern_name_lower for keyword in keywords):
+                return pattern_type
                 
-        return processed
+        # If no specific match is found, return 'main' as default
+        return 'main'
 
-    def _get_recommendation_for_pattern(self, pattern_type: str, severity: str) -> str:
-        """Get specific recommendation based on pattern type and severity"""
-        recommendations = {
-            'error': {
-                'critical': 'CRITICAL: Immediate investigation required. Review logs and system resources.',
-                'high': 'HIGH: Urgent review needed. Check error patterns and implement fixes.'
-            },
-            'warning': {
-                'critical': 'Review warning patterns for potential system issues.',
-                'high': 'Analyze warning trends and implement preventive measures.',
-                'medium': 'Monitor these warnings for potential escalation.'
-            },
-            'test_result': {
-                'critical': 'CRITICAL: Multiple test failures detected. Immediate investigation needed.',
-                'high': 'HIGH: Test failures require attention. Review test cases and data quality.',
-                'medium': 'Review test results and update test criteria as needed.'
-            },
-            'pod_status': {
-                'critical': 'CRITICAL: Kubernetes pod issues detected. Check cluster health.',
-                'high': 'HIGH: Review pod configurations and resource allocations.',
-                'medium': 'Monitor pod lifecycle and resource usage patterns.'
-            },
-            'performance': {
-                'critical': 'CRITICAL: Severe performance degradation. Check system resources.',
-                'high': 'HIGH: Performance issues detected. Review resource allocation.',
-                'medium': 'Monitor system performance metrics and trends.'
-            },
-            'airflow_task': {
-                'critical': 'CRITICAL: Task execution issues detected. Check DAG configuration.',
-                'high': 'HIGH: Review task dependencies and resource requirements.',
-                'medium': 'Monitor task execution patterns and optimize as needed.'
-            },
-            'dag_run': {
-                'critical': 'CRITICAL: DAG execution failures detected. Check scheduler logs.',
-                'high': 'HIGH: Review DAG configuration and dependencies.',
-                'medium': 'Monitor DAG performance and execution patterns.'
-            },
-            'scheduler': {
-                'critical': 'CRITICAL: Scheduler issues detected. Check Airflow configuration.',
-                'high': 'HIGH: Review scheduler logs and settings.',
-                'medium': 'Monitor scheduler health and performance.'
-            },
-            'database': {
-                'critical': 'CRITICAL: Database issues detected. Check connection and performance.',
-                'high': 'HIGH: Review database logs and connection settings.',
-                'medium': 'Monitor database performance and connection patterns.'
-            }
+    def _extract_airflow_context(self, log_info: str) -> Dict[str, str]:
+        """
+        Extract Airflow context information from log content.
+        
+        Args:
+            log_info: Raw log content string
+            
+        Returns:
+            Dictionary containing extracted context fields
+        """
+        context_fields = {
+            'dag_id': "AIRFLOW_CTX_DAG_ID='([^']+)'",
+            'dag_run_id': "AIRFLOW_CTX_DAG_RUN_ID='([^']+)'",
+            'task_id': "AIRFLOW_CTX_TASK_ID='([^']+)'",
+            'try_number': "AIRFLOW_CTX_TRY_NUMBER='([^']+)'",
+            'execution_date': "AIRFLOW_CTX_EXECUTION_DATE='([^']+)'"
         }
-
-        # Get pattern-specific recommendations
-        pattern_recommendations = recommendations.get(pattern_type, {})
         
-        # Get severity-specific recommendation or use a default
-        recommendation = pattern_recommendations.get(severity, 
-            f"Review and address {pattern_type.replace('_', ' ')} issues based on {severity} severity level.")
+        extracted_context = {}
         
-        # Add universal recommendations based on severity
-        if severity == 'critical':
-            recommendation += "\nRecommended Actions:\n" + \
-                "- Immediate investigation required\n" + \
-                "- Notify relevant team members\n" + \
-                "- Consider system health impact\n" + \
-                "- Document findings and actions taken"
-        elif severity == 'high':
-            recommendation += "\nRecommended Actions:\n" + \
-                "- Schedule urgent review\n" + \
-                "- Monitor for recurrence\n" + \
-                "- Plan remediation steps"
-        elif severity == 'medium':
-            recommendation += "\nRecommended Actions:\n" + \
-                "- Review during next maintenance\n" + \
-                "- Monitor for escalation\n" + \
-                "- Document patterns"
-        else:
-            recommendation += "\nRecommended Actions:\n" + \
-                "- Monitor for changes\n" + \
-                "- Include in regular review"
+        for field, pattern in context_fields.items():
+            match = re.search(pattern, log_info)
+            if match:
+                extracted_context[field] = match.group(1)
+                self.logger.debug(f"Extracted {field}: {extracted_context[field]}")
+            else:
+                extracted_context[field] = "unknown"
+                self.logger.warning(f"Could not extract {field} from log content")
+                
+        return extracted_context
 
-        return recommendation
+    def _analyze_test_failures(self, log_content: str) -> List[Dict]:
+        """
+        Analyze test failures in log content.
+        
+        Args:
+            log_content: Log content string to analyze
+            
+        Returns:
+            List of dictionaries containing test failure details
+        """
+        failures = []
+        failure_pattern = r"Failure in test([^:]+): (.+?)(?=\n|$)"
+        
+        for match in re.finditer(failure_pattern, log_content):
+            test_name = match.group(1).strip()
+            failure_message = match.group(2).strip()
+            
+            failures.append({
+                'test_name': test_name,
+                'failure_message': failure_message
+            })
+            self.logger.debug(f"Found test failure: {test_name}")
+            
+        return failures
+
+    def _analyze_pod_events(self, log_content: str) -> List[Dict]:
+        """
+        Analyze Kubernetes pod events in log content.
+        
+        Args:
+            log_content: Log content string to analyze
+            
+        Returns:
+            List of dictionaries containing pod event details
+        """
+        events = []
+        pod_pattern = r"Pod ([^\s]+) (has phase|returned) ([A-Za-z]+)"
+        
+        for match in re.finditer(pod_pattern, log_content):
+            pod_name = match.group(1)
+            event_type = match.group(2)
+            status = match.group(3)
+            
+            events.append({
+                'pod_name': pod_name,
+                'event_type': event_type,
+                'status': status
+            })
+            self.logger.debug(f"Found pod event: {pod_name} {event_type} {status}")
+            
+        return events 
     
-    def generate_system_prompt(self, analysis: Dict) -> str:
-        """Generate system prompt based on analysis results"""
-        # We can just return the AIRFLOW_LOG_ANALYSIS_PROMPT template
-        return AIRFLOW_LOG_ANALYSIS_PROMPT.template
+    def _generate_recommendations(self, pattern_results: Dict) -> List[Dict]:
+        """
+        Generate recommendations based on pattern results.
         
-    def _format_section(self, 
-                       name: str, 
-                       description: str, 
-                       data: Dict,
-                       config: Dict) -> str:
-        """Format a section of the system prompt"""
-        lines = [f"{name}:", description]
-        
-        # Add examples if configured
-        if config.get('include_examples'):
-            max_examples = config.get('max_examples', 2)
-            for severity, items in data.items():
-                examples = items[:max_examples]
-                for example in examples:
-                    lines.append(f"- {severity.upper()}: {example['content']}")
-                    
-        return '\n'.join(lines)
-        
-    def create_ollama_model(self, system_prompt: str) -> Dict:
-        """Create Ollama model request using config settings"""
-        model_config = self.config['model']        
-     
-        # Get just the template part without the variables
-        system_prompt = AIRFLOW_LOG_ANALYSIS_PROMPT.template.format(
-            context="",  # Empty context since this is just the system prompt
-            question=""  # Empty question since this is just the system prompt
-        )
-        
-        # Log the formatted prompt
-        self.logger.debug("Formatted system prompt:")
-        self.logger.debug(system_prompt)
-        
-        # Properly escape the prompt for the modelfile
-        escaped_prompt = system_prompt.replace('"', '\\"').replace('\n', '\\n')
-        
-        # Create modelfile with config parameters
-        modelfile = (
-            f"FROM {model_config['base_model']}\n"
-            f"PARAMETER temperature {model_config['parameters']['temperature']}\n"
-            f"PARAMETER top_p {model_config['parameters']['top_p']}\n"
-            f"PARAMETER num_ctx {model_config['parameters']['num_ctx']}\n"
-            f'SYSTEM "{escaped_prompt}"\n'
-            'TEMPLATE """{{.System}}\n\n'
-            'User: {{.Prompt}}\n\n'
-            'Assistant: {{.Response}}"""\n'
-        )
-        
-        request_data = {
-            "name": model_config['name'],
-            "modelfile": modelfile
-        }
-        
-        # Log the final request for debugging
-        #self.logger.debug("Model request:")
-        #self.logger.debug(json.dumps(request_data, indent=2))
-        
-        return request_data
-        
-    def format_ollama_analysis(self, analysis_response: Dict, analysis_data: Dict = None) -> str:
-        """Format Ollama's analysis response into a readable text format"""
-        formatted = []
-        formatted.append("=" * 80)
-        formatted.append("AIRFLOW LOG ANALYSIS REPORT")
-        formatted.append("=" * 80)
-        formatted.append("")
-
-        # Format timestamp
-        formatted.append(f"Analysis Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        formatted.append("")
-
-        # Add summary from analysis data if available
-        if analysis_data and 'summary' in analysis_data:
-            formatted.append("-" * 40)
-            formatted.append("ANALYSIS SUMMARY")
-            formatted.append("-" * 40)
-            summary = analysis_data['summary']
-            formatted.append(f"Total Logs Analyzed: {summary.get('total_logs_analyzed', 'N/A')}")
-            formatted.append(f"Time Period: {summary.get('time_period', 'N/A')}")
-            formatted.append(f"Total Issues Found: {summary.get('total_issues_found', 'N/A')}")
-            formatted.append("")
-
-        # Add pattern analysis if available
-        if analysis_data and 'patterns' in analysis_data:
-            formatted.append("-" * 40)
-            formatted.append("DETECTED PATTERNS")
-            formatted.append("-" * 40)
+        Args:
+            pattern_results: Dictionary containing pattern matches
             
-            patterns = analysis_data['patterns']
-            for pattern_type, severities in patterns.items():
-                formatted.append(f"\n{pattern_type.replace('_', ' ').title()}:")
-                for severity, issues in severities.items():
-                    formatted.append(f"\n  {severity.upper()} Severity Issues:")
-                    for issue in issues:
-                        formatted.append(f"    - {issue['content']}")
-                        if 'frequency' in issue:
-                            formatted.append(f"      Frequency: {issue['frequency']} occurrences")
-                        if 'context' in issue and issue['context']:
-                            formatted.append(f"      Context: {issue['context']}")
-            formatted.append("")
-
-        # Format the response content
-        if 'response' in analysis_response:
-            formatted.append("-" * 40)
-            formatted.append("AI ANALYSIS")
-            formatted.append("-" * 40)
-            
-            response_text = analysis_response['response']
-            sections = response_text.split('\n')
-            current_section = []
-            
-            for line in sections:
-                if line.strip():  # Skip empty lines
-                    if line.startswith(('1.', '2.', '3.', '4.', '5.')):
-                        # If we have content in current section, add it
-                        if current_section:
-                            formatted.extend(current_section)
-                            formatted.append("")
-                            current_section = []
-                        # Start new section
-                        formatted.append(line.strip())
-                    else:
-                        # Add to current section with proper indentation
-                        current_section.append("  " + line.strip())
-            
-            # Add any remaining content
-            if current_section:
-                formatted.extend(current_section)
-
-        # Add recommendations if available
-        if analysis_data and 'recommendations' in analysis_data:
-            formatted.append("")
-            formatted.append("-" * 40)
-            formatted.append("RECOMMENDATIONS")
-            formatted.append("-" * 40)
-            for rec in analysis_data['recommendations']:
-                formatted.append(f"Issue: {rec['issue']} (Severity: {rec['severity']})")
-                formatted.append(f"Suggestion: {rec['suggestion']}")
-                formatted.append("")
-
-        # Add model metadata if available
-        if 'eval_count' in analysis_response or 'eval_duration' in analysis_response:
-            formatted.append("-" * 40)
-            formatted.append("Analysis Metadata")
-            formatted.append("-" * 40)
-            if 'eval_count' in analysis_response:
-                formatted.append(f"Eval Count: {analysis_response['eval_count']}")
-            if 'eval_duration' in analysis_response:
-                formatted.append(f"Duration: {analysis_response['eval_duration']} ms")
-
-        return "\n".join(formatted)
-
-    def save_analysis_report(self, ollama_response: Dict, output_file: str = None):
-        """Save formatted analysis report to a text file"""
-        if output_file is None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_file = f"airflow_analysis_report_{timestamp}.txt"
-
-        # Get the latest analysis results
-        analysis_data = None
-        if hasattr(self, 'analysis_results') and self.analysis_results:
-            # Calculate total issues found
-            total_issues = 0
-            for pattern_type, severities in self.analysis_results.items():
-                if isinstance(severities, dict):
-                    for severity_level, issues in severities.items():
-                        if isinstance(issues, list):
-                            total_issues += len(issues)
-
-            analysis_data = {
-                'summary': {
-                    'total_logs_analyzed': sum(
-                        len(severity_data)
-                        for pattern_data in self.analysis_results.values()
-                        if isinstance(pattern_data, dict)
-                        for severity_data in pattern_data.values()
-                        if isinstance(severity_data, list)
-                    ),
-                    'time_period': f"{self.config['analysis']['days_back']} days",
-                    'total_issues_found': total_issues
-                },
-                'patterns': self.analysis_results,
-                'recommendations': self._generate_recommendations(self.analysis_results)
-            }
-
-        formatted_analysis = self.format_ollama_analysis(ollama_response, analysis_data)
-        
-        output_path = self._get_output_path(output_file, datetime.now().strftime('%Y%m%d_%H%M%S'))
-        self._save_text(formatted_analysis, output_path)
-        self.logger.info(f"Saved analysis report to {output_path}")
-        
-        return output_path
-
-    def _generate_recommendations(self, analysis_results: Dict) -> List[Dict]:
-        """Generate recommendations based on analysis results"""
+        Returns:
+            List of recommendation dictionaries
+        """
         recommendations = []
         
-        for pattern_type, severities in analysis_results.items():
+        for pattern_type, severities in pattern_results.items():
             if isinstance(severities, dict):
                 for severity, issues in severities.items():
                     if severity in ['critical', 'high'] and issues and isinstance(issues, list):
@@ -657,38 +523,138 @@ class LogAnalyzer:
         
         return recommendations
 
-    def _get_output_path(self, filename: str, timestamp: str) -> Path:
-        """Get output path with optional timestamp"""
+    def _get_recommendation_for_pattern(self, pattern_type: str, severity: str) -> str:
+        """
+        Get specific recommendation based on pattern type and severity.
+        
+        Args:
+            pattern_type: Type of pattern detected
+            severity: Severity level of the issue
+            
+        Returns:
+            String containing the recommendation
+        """
+        recommendations = {
+            'error': {
+                'critical': 'CRITICAL: Immediate investigation required. Review logs and system resources.',
+                'high': 'HIGH: Urgent review needed. Check error patterns and implement fixes.',
+                'medium': 'Review error patterns and plan fixes during next maintenance window.'
+            },
+            'test_failure': {
+                'critical': 'CRITICAL: Multiple test failures detected. Immediate investigation needed.',
+                'high': 'HIGH: Test failures require attention. Review test cases and data quality.',
+                'medium': 'Review test results and update test criteria as needed.'
+            },
+            'pod_status': {
+                'critical': 'CRITICAL: Kubernetes pod issues detected. Check cluster health.',
+                'high': 'HIGH: Review pod configurations and resource allocations.',
+                'medium': 'Monitor pod lifecycle and resource usage patterns.'
+            },
+            'performance': {
+                'critical': 'CRITICAL: Severe performance degradation. Check system resources.',
+                'high': 'HIGH: Performance issues detected. Review resource allocation.',
+                'medium': 'Monitor system performance metrics and trends.'
+            },
+            'airflow_task': {
+                'critical': 'CRITICAL: Task execution issues detected. Check DAG configuration.',
+                'high': 'HIGH: Review task dependencies and resource requirements.',
+                'medium': 'Monitor task execution patterns and optimize as needed.'
+            }
+        }
+
+        # Get pattern-specific recommendations
+        pattern_recommendations = recommendations.get(pattern_type, {})
+        
+        # Get severity-specific recommendation or use default
+        recommendation = pattern_recommendations.get(severity, 
+            f"Review and address {pattern_type.replace('_', ' ')} issues based on {severity} severity level.")
+        
+        # Add universal recommendations based on severity
+        if severity == 'critical':
+            recommendation += "\nRecommended Actions:\n" + \
+                "- Immediate investigation required\n" + \
+                "- Notify relevant team members\n" + \
+                "- Consider system health impact\n" + \
+                "- Document findings and actions taken"
+        elif severity == 'high':
+            recommendation += "\nRecommended Actions:\n" + \
+                "- Schedule urgent review\n" + \
+                "- Monitor for recurrence\n" + \
+                "- Plan remediation steps"
+                
+        return recommendation
+
+    def get_log_counts(self) -> Dict[str, int]:
+        """
+        Get counts of logs analyzed and patterns found.
+        
+        Returns:
+            Dictionary containing log and pattern count statistics
+        """
+        return {
+            'total_logs': getattr(self, 'total_logs', 0),
+            'processed_logs': getattr(self, 'processed_logs', 0),
+            'pattern_matches': sum(
+                len(severity_data)
+                for pattern_data in self.analysis_results.values()
+                if isinstance(pattern_data, dict)
+                for severity_data in pattern_data.values()
+                if isinstance(severity_data, list)
+            )
+        }
+
+    def _format_output_path(self, filename: str, timestamp: str = None) -> Path:
+        """
+        Format output path with optional timestamp.
+        
+        Args:
+            filename: Base filename
+            timestamp: Optional timestamp string
+            
+        Returns:
+            Path object for the formatted output path
+        """
         path = Path(filename)
-        if self.config['output']['include_timestamp']:
+        if timestamp and self.config['output']['include_timestamp']:
             return path.with_name(f"{path.stem}_{timestamp}{path.suffix}")
         return path
         
-    def _save_json(self, data: Dict, path: Path, indent: int):
-        """Save data as JSON with custom encoder for MongoDB types"""
+    def _save_json(self, data: Dict, path: Path):
+        """
+        Save dictionary as JSON with proper encoding.
+        
+        Args:
+            data: Dictionary to save
+            path: Path where to save the JSON file
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as f:
-            json.dump(data, f, indent=indent, cls=MongoJSONEncoder)
+            json.dump(
+                data, 
+                f, 
+                indent=self.config['output'].get('json_indent', 2),
+                cls=MongoJSONEncoder
+            )
         self.logger.info(f"Saved JSON to {path}")
         
     def _save_text(self, text: str, path: Path):
-        """Save text to file"""
+        """
+        Save text content to file.
+        
+        Args:
+            text: Text content to save
+            path: Path where to save the text file
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w') as f:
             f.write(text)
         self.logger.info(f"Saved text to {path}")
 
-    def save_outputs(self, analysis: Dict, system_prompt: str, model_request: Dict):
-        """Save outputs based on configuration"""
-        output_config = self.config['output']
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        if output_config['save_analysis']:
-            path = self._get_output_path(output_config['analysis_file'], timestamp)
-            self._save_json(analysis, path, output_config['json_indent'])
-            
-        if output_config['save_prompt']:
-            path = self._get_output_path(output_config['prompt_file'], timestamp)
-            self._save_text(system_prompt, path)
-            
-        if output_config['save_model_request']:
-            path = self._get_output_path(output_config['model_request_file'], timestamp)
-            self._save_json(model_request, path, output_config['json_indent'])        
+    def cleanup(self):
+        """Cleanup resources and connections."""
+        try:
+            if hasattr(self, 'client'):
+                self.client.close()
+                self.logger.info("Closed MongoDB connection")
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {str(e)}")                   

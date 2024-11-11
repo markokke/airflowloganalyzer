@@ -9,6 +9,22 @@ An AI-powered tool for analyzing Apache Airflow logs using Ollama models.
 pip install -r requirements.txt
 ```
 
+### Mongo DB Index 
+```bash
+db.DagTaskLogs.createIndex(
+  { "LogInfo": "text" },
+  {
+    "weights": {
+      "LogInfo": 1
+    },
+    "default_language": "english",
+    "language_override": "language",
+    "sparse": true,
+    "background": true,
+    "name": "LogInfo_text"
+  }
+)
+```
 ## Usage
 
 ```bash

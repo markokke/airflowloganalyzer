@@ -50,7 +50,7 @@ class LogAnalyzer:
         self.analysis_results = {}
 
     def _init_mongodb(self):
-        """Initialize MongoDB connections with better error handling."""
+        """Initialize MongoDB connections with comprehensive error handling and index management."""
         mongo_config = self.config.get('mongodb')
         if not mongo_config:
             raise ValueError("MongoDB configuration is missing from config")
@@ -82,28 +82,27 @@ class LogAnalyzer:
                 # Old style configuration
                 self.log_collection = self.db[mongo_config['collection_name']]
                 self.analysis_collection = self.db['AirflowLogAnalysis']
-            
-            # Default index configuration
-            default_indexes = [
-                {'field': 'dag_id', 'direction': 1},
-                {'field': 'dag_run_id', 'direction': 1},
-                {'field': 'task_id', 'direction': 1},
-                {'field': 'try_number', 'direction': 1},
-                {'field': 'timestamp', 'direction': -1}
-            ]
-            
-            # Get index configuration or use defaults
-            index_config = mongo_config.get('analysis_indexes', default_indexes)
-            
-            # Create indexes
-            self._ensure_analysis_indexes(index_config)
-            
-            # Verify log collection exists and has documents
-            doc_count = self.log_collection.count_documents({})
-            self.logger.info(f"Found {doc_count} documents in logs collection")
-            
-            if doc_count == 0:
-                self.logger.warning("Logs collection is empty")
+
+            # Handle text indexes if configured
+            if 'indexes' in mongo_config and 'text_indexes' in mongo_config['indexes']:
+                self._ensure_text_indexes(mongo_config['indexes']['text_indexes'])
+
+            # Handle analysis indexes
+            if 'analysis_indexes' in mongo_config:
+                self._ensure_analysis_indexes(mongo_config['analysis_indexes'])
+            else:
+                # Default index configuration if not specified
+                default_indexes = [
+                    {'field': 'dag_id', 'direction': 1},
+                    {'field': 'dag_run_id', 'direction': 1},
+                    {'field': 'task_id', 'direction': 1},
+                    {'field': 'try_number', 'direction': 1},
+                    {'field': 'timestamp', 'direction': -1}
+                ]
+                self._ensure_analysis_indexes(default_indexes)
+                
+            # Verify collections exist and have documents
+            self._verify_collections()
                 
         except pymongo.errors.ServerSelectionTimeoutError as e:
             self.logger.error(f"Could not connect to MongoDB server: {str(e)}")
@@ -115,7 +114,53 @@ class LogAnalyzer:
             self.logger.error(f"Failed to initialize MongoDB: {str(e)}")
             raise
 
-    def _ensure_analysis_indexes(self, index_config: List[Dict]):
+    def _ensure_text_indexes(self, text_index_configs):
+        """Ensure text indexes are properly configured."""
+        try:
+            # Get existing indexes
+            existing_indexes = list(self.log_collection.list_indexes())
+            existing_text_indexes = [
+                idx for idx in existing_indexes 
+                if idx.get('key', {}).get('_fts') == 'text'
+            ]
+
+            for idx_config in text_index_configs:
+                if not idx_config.get('enabled', False):
+                    continue
+
+                field = idx_config['field']
+                weights = idx_config.get('weights', {field: 1})
+                
+                # Check if we need to drop and recreate the text index
+                needs_recreation = False
+                if existing_text_indexes:
+                    current_idx = existing_text_indexes[0]  # MongoDB allows only one text index
+                    current_weights = current_idx.get('weights', {})
+                    if current_weights != weights:
+                        self.logger.info("Text index weights have changed, recreating index")
+                        needs_recreation = True
+                        # Drop existing text index
+                        self.log_collection.drop_index(current_idx['name'])
+                else:
+                    needs_recreation = True
+
+                if needs_recreation:
+                    self.logger.info(f"Creating text index on {field}")
+                    self.log_collection.create_index(
+                        [(field, 'text')],
+                        weights=weights,
+                        default_language=idx_config.get('default_language', 'english'),
+                        language_override=idx_config.get('language_override', 'language'),
+                        sparse=idx_config.get('sparse', True),
+                        background=idx_config.get('background', True)
+                    )
+                    self.logger.info(f"Successfully created text index on {field}")
+
+        except Exception as e:
+            self.logger.error(f"Error ensuring text indexes: {str(e)}")
+            raise
+
+    def _ensure_analysis_indexes(self, index_config):
         """Ensure required indexes exist on the analysis collection."""
         try:
             existing_indexes = self.analysis_collection.list_indexes()
@@ -139,6 +184,28 @@ class LogAnalyzer:
         except Exception as e:
             self.logger.error(f"Error ensuring analysis indexes: {str(e)}")
             raise
+
+    def _verify_collections(self):
+        """Verify collections exist and have documents."""
+        try:
+            # Check log collection
+            log_count = self.log_collection.count_documents({})
+            self.logger.info(f"Found {log_count} documents in logs collection")
+            
+            if log_count == 0:
+                self.logger.warning("Logs collection is empty")
+
+            # Check analysis collection
+            analysis_count = self.analysis_collection.count_documents({})
+            self.logger.debug(f"Found {analysis_count} documents in analysis collection")
+            
+            # Get and log the names of all collections in the database
+            all_collections = self.db.list_collection_names()
+            self.logger.debug(f"Available collections in database: {all_collections}")
+            
+        except Exception as e:
+            self.logger.error(f"Error verifying collections: {str(e)}")
+            raise
         
     def analyze_individual_logs(self) -> List[Dict]:
         """Analyze each log entry individually and return list of analysis results."""
@@ -151,20 +218,49 @@ class LogAnalyzer:
             cutoff_date = datetime.now() - timedelta(days=days_back)
             cutoff_object_id = ObjectId.from_datetime(cutoff_date)
             
-            self.logger.info(f"Analyzing individual logs from the last {days_back} days")
+            # Check if text index exists
+            indexes = list(self.log_collection.list_indexes())
+            has_text_index = any(
+                idx.get('key', {}).get('_fts') == 'text' and 
+                'LogInfo' in idx.get('weights', {})
+                for idx in indexes
+            )
             
-            # Query logs
+            if has_text_index:
+                # Use $text search with $regex fallback for exact pattern
+                query = {
+                    "_id": {"$gte": cutoff_object_id},
+                    "$and": [
+                        {"$text": {"$search": "Task exit code 1"}},
+                        {"LogInfo": {"$regex": ".*Task exited with return code 1.*"}}
+                    ]
+                }
+            else:
+                # Use only regex if no text index
+                query = {
+                    "_id": {"$gte": cutoff_object_id},
+                    "LogInfo": {"$regex": ".*Task exited with return code 1.*"}
+                }            
+
+            self.logger.debug(f"Using query: {query}")
+                
+            # Execute query
             logs = self.log_collection.find(
-                {"_id": {"$gte": cutoff_object_id}},
+                query,
                 batch_size=self.config['mongodb']['batch_size']
             )
+            
+            # Get total count using same query
+            total_logs = self.log_collection.count_documents(query)
+            self.logger.info(f"Found {total_logs} logs to analyze")
             
             analysis_results = []
             ollama_client = OllamaClient(model_name=self.config['model']['name'], config=self.config)
             report_generator = ReportGenerator(self.config)
             
             log_count = 0
-            total_logs = self.log_collection.count_documents({"_id": {"$gte": cutoff_object_id}})
+            total_logs = self.log_collection.count_documents({"_id": {"$gte": cutoff_object_id},
+                    "LogInfo": {"$regex": ".*Task exited with return code 1.*"}})
             self.logger.info(f"Found {total_logs} logs to analyze")
 
             for log in logs:

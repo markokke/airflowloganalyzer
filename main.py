@@ -35,21 +35,45 @@ def setup_logging(config: Dict) -> logging.Logger:
         sys.exit(1)
 
 def initialize_services(config: Dict):
-    """
-    Initialize the main services needed for log analysis.
-    
-    Args:
-        config: Configuration dictionary
-    
-    Returns:
-        Tuple of (LogAnalyzer, ReportGenerator)
-    """
+    """Initialize the main services needed for log analysis."""
     try:
-        analyzer = LogAnalyzer(config)
         report_generator = ReportGenerator(config)
+        analyzer = LogAnalyzer(config=config, report_generator=report_generator)
         return analyzer, report_generator
     except Exception as e:
         print(f"Error initializing services: {str(e)}")
+        sys.exit(1)
+
+def main():
+    """Main execution function."""
+    try:
+        # Load configuration
+        config = load_config('config.yaml')
+        
+        # Setup logging
+        logger = setup_logging(config)
+        logger.info("Starting Individual Log Analysis")
+        
+        # Initialize services
+        analyzer, report_generator = initialize_services(config)
+        
+        try:
+            # Analyze individual logs
+            logger.info("Starting log analysis...")
+            analysis_results = analyzer.analyze_individual_logs()
+            
+            # Log the completion statistics
+            logger.info(f"Completed analysis of {len(analysis_results)} logs")
+            print(f"\nCompleted analysis of {len(analysis_results)} logs")
+                
+        except Exception as e:
+            logger.error("Error during log analysis")
+            logger.exception("Analysis error details:")
+            raise
+            
+    except Exception as e:
+        logger.error(f"Critical error in main: {str(e)}")
+        logger.exception("Full error details:")
         sys.exit(1)
 
 def main():

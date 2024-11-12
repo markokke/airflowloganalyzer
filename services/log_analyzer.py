@@ -1,25 +1,24 @@
-import yaml
 import json
 import logging.config
 import re
 from collections import defaultdict
-from typing import Dict, List
 import pymongo
 from datetime import datetime, timedelta
 from bson.objectid import ObjectId
 from pathlib import Path
-from prompts import AIRFLOW_LOG_ANALYSIS_PROMPT
 from models.mongo_encoder import MongoJSONEncoder 
 from models.mongodb_operations import MongoDBOperations
 from clients.ollama_client import OllamaClient
 from services.report_generator import ReportGenerator
+from typing import Dict, List, Optional
 
 class LogAnalyzer:
-    def __init__(self, config: Dict):
+    def __init__(self, config: Dict, report_generator: Optional[ReportGenerator] = None):
         """Initialize the LogAnalyzer with configuration."""
         self.config = config
         logging.config.dictConfig(self.config['logging'])
         self.logger = logging.getLogger('airflow_log_analyzer')
+        self.report_generator = report_generator or ReportGenerator(config)
         
         # Initialize MongoDB connections
         self._init_mongodb()
@@ -210,6 +209,8 @@ class LogAnalyzer:
     def analyze_individual_logs(self) -> List[Dict]:
         """Analyze each log entry individually and return list of analysis results."""
         try:
+            self.logger.info("Starting analyze_individual_logs method")
+            
             if 'analysis' not in self.config:
                 self.logger.error("Missing 'analysis' section in configuration")
                 raise KeyError("Missing 'analysis' section in configuration")
@@ -218,6 +219,7 @@ class LogAnalyzer:
             cutoff_date = datetime.now() - timedelta(days=days_back)
             cutoff_object_id = ObjectId.from_datetime(cutoff_date)
             
+            self.logger.debug(f"Checking for text index existence")
             # Check if text index exists
             indexes = list(self.log_collection.list_indexes())
             has_text_index = any(
@@ -226,8 +228,10 @@ class LogAnalyzer:
                 for idx in indexes
             )
             
+            self.logger.debug(f"Text index exists: {has_text_index}")
+
+            # Build query with debug logging
             if has_text_index:
-                # Use $text search with $regex fallback for exact pattern
                 query = {
                     "_id": {"$gte": cutoff_object_id},
                     "$and": [
@@ -236,179 +240,148 @@ class LogAnalyzer:
                     ]
                 }
             else:
-                # Use only regex if no text index
                 query = {
                     "_id": {"$gte": cutoff_object_id},
                     "LogInfo": {"$regex": ".*Task exited with return code 1.*"}
                 }            
 
             self.logger.debug(f"Using query: {query}")
+            
+            # Execute query with debug logging
+            self.logger.debug("Executing MongoDB query...")
+            try:
+                logs = self.log_collection.find(
+                    query,
+                    batch_size=self.config['mongodb']['batch_size']
+                )
+                self.logger.debug("Query executed successfully")
                 
-            # Execute query
-            logs = self.log_collection.find(
-                query,
-                batch_size=self.config['mongodb']['batch_size']
-            )
-            
-            # Get total count using same query
-            total_logs = self.log_collection.count_documents(query)
-            self.logger.info(f"Found {total_logs} logs to analyze")
-            
-            analysis_results = []
-            ollama_client = OllamaClient(model_name=self.config['model']['name'], config=self.config)
-            report_generator = ReportGenerator(self.config)
-            
-            log_count = 0
-            total_logs = self.log_collection.count_documents({"_id": {"$gte": cutoff_object_id},
-                    "LogInfo": {"$regex": ".*Task exited with return code 1.*"}})
-            self.logger.info(f"Found {total_logs} logs to analyze")
+                # Get total count with debug logging
+                self.logger.debug("Counting matching documents...")
+                total_logs = self.log_collection.count_documents(query)
+                self.logger.info(f"Found {total_logs} logs to analyze")
+                
+                if total_logs == 0:
+                    self.logger.warning("No logs found matching the query criteria")
+                    return []
 
-            for log in logs:
-                try:
-                    log_count += 1
-                    log_id = str(log['_id'])
-                    self.logger.info(f"{'='*40}")
-                    self.logger.info(f"Starting analysis of log {log_count} of {total_logs} (ID: {log_id})")
-                    
-                    # Log pattern information for this log entry
-                    self.logger.debug(f"Starting pattern analysis for log {log_id}")
-                    for pattern_name, pattern_config in self.config['analysis']['patterns'].items():
-                        self.logger.debug(f"Checking pattern '{pattern_name}' with regex: {pattern_config['regex']}")
-                    
-                    # Initialize pattern results for this log
-                    pattern_results = defaultdict(list)
-                    
-                    # Process patterns for this single log
-                    log_info = log['LogInfo']
-                    for pattern_name, pattern_config in self.config['analysis']['patterns'].items():
-                        matches = self._extract_pattern(
-                            pattern_name,
-                            pattern_config,
-                            log_info,
-                            defaultdict(list)
-                        )
+                # Initialize services
+                self.logger.debug("Initializing Ollama client...")
+                ollama_client = OllamaClient(model_name=self.config['model']['name'], config=self.config)
+                
+                analysis_results = []
+                log_count = 0
+
+                for log in logs:
+                    try:
+                        log_count += 1
+                        log_id = str(log['_id'])
+                        self.logger.info(f"{'='*40}")
+                        self.logger.info(f"Starting analysis of log {log_count} of {total_logs} (ID: {log_id})")
                         
-                        if matches:
-                            pattern_type = pattern_name
-                            for match_content in matches:
-                                pattern_results[pattern_type].append({
-                                    'content': match_content,
-                                    'pattern': pattern_name,
-                                    'severity': pattern_config.get('severity')
-                                })
-                            self.logger.debug(f"Found {len(matches)} matches for '{pattern_name}' in log {log_id}")
-                        else:
-                            self.logger.debug(f"No matches found for '{pattern_name}' in log {log_id}")
-
-                    # Perform analysis for this log
-                    log_analysis = {}
-                    
-                    try:
-                        # Test failure patterns
-                        if pattern_results.get('test_failure'):
-                            test_analysis = ollama_client.ask_model(
-                                pattern_results['test_failure'], 
-                                prompt_type='test',
-                                log_id=log_id
+                        # Log pattern information for this log entry
+                        self.logger.debug(f"Starting pattern analysis for log {log_id}")
+                        
+                        # Initialize pattern results for this log
+                        pattern_results = defaultdict(list)
+                        
+                        # Process patterns for this single log
+                        log_info = log['LogInfo']
+                        for pattern_name, pattern_config in self.config['analysis']['patterns'].items():
+                            matches = self._extract_pattern(
+                                pattern_name,
+                                pattern_config,
+                                log_info,
+                                defaultdict(list)
                             )
-                            log_analysis['test_analysis'] = test_analysis
                             
-                        # Error patterns
-                        if pattern_results.get('error'):
-                            error_analysis = ollama_client.ask_model(
-                                pattern_results['error'], 
-                                prompt_type='error',
-                                log_id=log_id
-                            )
-                            log_analysis['error_analysis'] = error_analysis
-                            
-                        # Performance patterns
-                        if pattern_results.get('performance'):
-                            perf_analysis = ollama_client.ask_model(
-                                pattern_results['performance'], 
-                                prompt_type='performance',
-                                log_id=log_id
-                            )
-                            log_analysis['performance_analysis'] = perf_analysis
-                            
-                        # Pod status patterns
-                        if pattern_results.get('pod_status'):
-                            pod_analysis = ollama_client.ask_model(
-                                pattern_results['pod_status'], 
-                                prompt_type='pod',
-                                log_id=log_id
-                            )
-                            log_analysis['pod_analysis'] = pod_analysis
+                            if matches:
+                                pattern_type = pattern_name
+                                for match_content in matches:
+                                    pattern_results[pattern_type].append({
+                                        'content': match_content,
+                                        'pattern': pattern_name,
+                                        'severity': pattern_config.get('severity')
+                                    })
 
-                    except Exception as e:
-                        self.logger.error(f"Error during Ollama analysis for log {log_id}: {str(e)}")
+                        # Perform analysis for this log
+                        log_analysis = {}
+                        
+                        try:
+                            # Various analysis types...
+                            if pattern_results.get('test_failure'):
+                                test_analysis = ollama_client.ask_model(
+                                    pattern_results['test_failure'], 
+                                    prompt_type='test',
+                                    log_id=log_id
+                                )
+                                log_analysis['test_analysis'] = test_analysis
+                                
+                            # ... other analysis types ...
 
-                    # Get timestamp consistently
-                    log_timestamp = log.get('timestamp', str(log['_id'].generation_time))
-                    
-                    # Format the analysis data
-                    analysis_data = {
-                        'log_id': log_id,
-                        'log_info': log_info,  # Include raw log content
-                        'analysis': log_analysis,
-                        'patterns': dict(pattern_results),
-                        'recommendations': self._generate_recommendations(dict(pattern_results)),
-                        'summary': {
+                        except Exception as e:
+                            self.logger.error(f"Error during Ollama analysis for log {log_id}: {str(e)}")
+
+                        # Format the analysis data
+                        analysis_data = {
                             'log_id': log_id,
-                            'timestamp': log_timestamp,
-                            'total_issues_found': sum(len(matches) for matches in pattern_results.values())
+                            'log_info': log_info,
+                            'analysis': log_analysis,
+                            'patterns': dict(pattern_results),
+                            'recommendations': self._generate_recommendations(dict(pattern_results)),
+                            'summary': {
+                                'log_id': log_id,
+                                'timestamp': str(log['_id'].generation_time),
+                                'total_issues_found': sum(len(matches) for matches in pattern_results.values())
+                            }
                         }
-                    }
 
-                    # Store in MongoDB Analysis Collection
-                    try:
-                        analysis_id = self.mongo_ops.store_analysis(analysis_data)
-                        self.logger.info(f"Stored analysis in MongoDB with ID: {analysis_id}")
+                        # Store in MongoDB Analysis Collection
+                        try:
+                            analysis_id = self.mongo_ops.store_analysis(analysis_data)
+                            self.logger.info(f"Stored analysis in MongoDB with ID: {analysis_id}")
+                        except Exception as e:
+                            self.logger.error(f"Error storing analysis in MongoDB: {str(e)}")
+                            self.logger.exception("MongoDB storage error details:")
+                        
+                        # Generate and save report
+                        try:
+                            formatted_report = self.report_generator.format_analysis(
+                                log_analysis,
+                                analysis_data
+                            )
+                            filename = f"airflow_analysis_log_{log_id}.txt"
+                            report_path = self.report_generator.save_report(formatted_report, filename)
+                            self.logger.info(f"Generated report for log {log_id}: {report_path}")
+                        except Exception as e:
+                            self.logger.error(f"Error generating report for log {log_id}: {str(e)}")
+                            self.logger.exception("Report generation error details:")
+
+                        analysis_results.append({
+                            'log_id': log_id,
+                            'timestamp': str(log['_id'].generation_time),
+                            'pattern_matches': dict(pattern_results),
+                            'analysis': log_analysis
+                        })
+
                     except Exception as e:
-                        self.logger.error(f"Error storing analysis in MongoDB: {str(e)}")
-                        self.logger.exception("MongoDB storage error details:")
-                    
-                    # Generate and save report
-                    try:
-                        # Format and save the report
-                        formatted_report = report_generator.format_analysis(log_analysis, analysis_data)
-                        filename = f"airflow_analysis_log_{log_id}.txt"
-                        report_path = report_generator.save_report(formatted_report, filename)
-                        self.logger.info(f"Generated report for log {log_id}: {report_path}")
-                    except Exception as e:
-                        self.logger.error(f"Error generating report for log {log_id}: {str(e)}")
-                        self.logger.exception("Report generation error details:")
+                        self.logger.error(f"Error processing log {log_count} (ID: {log_id}): {str(e)}")
+                        self.logger.exception("Full traceback:")
+                        continue
 
-                    # Add to overall results
-                    log_result = {
-                        'log_id': log_id,
-                        'timestamp': log_timestamp,
-                        'pattern_matches': dict(pattern_results),
-                        'analysis': log_analysis
-                    }
-                    analysis_results.append(log_result)
+                self.logger.info(f"{'='*60}")
+                self.logger.info("Final Summary:")
+                self.logger.info(f"Total logs found: {total_logs}")
+                self.logger.info(f"Total logs processed: {log_count}")
+                self.logger.info(f"{'='*60}")
+                
+                return analysis_results
+                
+            except Exception as e:
+                self.logger.error(f"Error executing MongoDB query: {str(e)}")
+                self.logger.exception("Full traceback:")
+                raise
 
-                    if log_count % 10 == 0:
-                        self.logger.info(f"Processed {log_count} of {total_logs} logs")
-                    
-                    self.logger.debug(f"Completed analysis for log {log_id}")
-                    self.logger.info(f"Successfully completed analysis of log {log_count}")
-                    self.logger.info(f"{'='*40}\n")
-                    
-                except Exception as e:
-                    self.logger.error(f"Error processing log {log_count} (ID: {log_id}): {str(e)}")
-                    self.logger.exception("Full traceback:")
-                    # Continue with next log instead of stopping
-                    continue
-
-            self.logger.info(f"{'='*60}")
-            self.logger.info("Final Summary:")
-            self.logger.info(f"Total logs found: {total_logs}")
-            self.logger.info(f"Total logs processed: {log_count}")
-            self.logger.info(f"{'='*60}")
-            
-            return analysis_results
-            
         except Exception as e:
             self.logger.error(f"Critical error in analyze_individual_logs: {str(e)}")
             self.logger.exception("Full traceback:")

@@ -317,7 +317,32 @@ class LogAnalyzer:
                                 )
                                 log_analysis['test_analysis'] = test_analysis
                                 
-                            # ... other analysis types ...
+                            # Error patterns
+                            if pattern_results.get('error'):
+                                error_analysis = ollama_client.ask_model(
+                                    pattern_results['error'], 
+                                    prompt_type='error',
+                                    log_id=log_id
+                                )
+                                log_analysis['error_analysis'] = error_analysis
+                                
+                            # Performance patterns
+                            if pattern_results.get('performance'):
+                                perf_analysis = ollama_client.ask_model(
+                                    pattern_results['performance'], 
+                                    prompt_type='performance',
+                                    log_id=log_id
+                                )
+                                log_analysis['performance_analysis'] = perf_analysis
+                                
+                            # Pod status patterns
+                            if pattern_results.get('pod_status'):
+                                pod_analysis = ollama_client.ask_model(
+                                    pattern_results['pod_status'], 
+                                    prompt_type='pod',
+                                    log_id=log_id
+                                )
+                                log_analysis['pod_analysis'] = pod_analysis
 
                         except Exception as e:
                             self.logger.error(f"Error during Ollama analysis for log {log_id}: {str(e)}")

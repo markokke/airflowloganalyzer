@@ -178,25 +178,25 @@ logging:
   handlers:
     console:
       class: logging.StreamHandler
-      level: DEBUG  # Change this from INFO to DEBUG
+      level: INFO  # Change this from INFO to DEBUG
       formatter: standard
       stream: ext://sys.stdout
     
     file:
       class: logging.FileHandler
-      level: DEBUG  # Change this from INFO to DEBUG
+      level: INFO  # Change this from INFO to DEBUG
       formatter: standard
       filename: 'airflow_log_analyzer.log'
       mode: 'a'
   
   loggers:
     airflow_log_analyzer:
-      level: DEBUG  # Change this from INFO to DEBUG
-      handlers: [console, file]
+      level: INFO  # Change this from INFO to DEBUG
+      handlers: [file]   # console, file or both seperated by comma
       propagate: false
 
 output:
-  output_dir: "F:/reports"
+  output_dir: "C:/reports"
   subdirectories:
     reports: "reports"
     json: "json"

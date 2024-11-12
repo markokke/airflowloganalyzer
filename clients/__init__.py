@@ -6,4 +6,4 @@ Contains clients for external services like Ollama.
 
 from .ollama_client import OllamaClient
 
-__all__ = ['OllamaClient']
+__all__ = ["OllamaClient"]

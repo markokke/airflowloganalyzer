@@ -1,0 +1,85 @@
+# Maximum line length
+line-length = 120
+
+# Python version target
+target-version = ['py38']
+
+# Include files that match these patterns
+include = '\.pyi?$'
+
+# Exclude files or directories matching these patterns
+extend-exclude = '''
+# Exclude by regex patterns
+# A regex preceded with ^/ will apply only to files and directories in the root of the project
+^/\.git/
+^/\.venv/
+^/venv/
+^/env/
+^/build/
+^/dist/
+^/\.eggs/
+^/\.mypy_cache/
+^/\.tox/
+^/\.pytest_cache/
+^/__pycache__/
+^/docs/
+^/\.coverage
+^/coverage\.xml
+^/htmlcov/
+^/\.idea/
+^/\.vscode/
+^/notebooks/
+# Specific files to exclude
+^/setup\.py$
+^/conf\.py$
+'''
+
+# Use single quotes instead of double quotes
+skip-string-normalization = false
+
+# Don't use parentheses for really long strings
+experimental-string-processing = false
+
+# Preview new features before enabling them
+preview = false
+
+# Don't normalize magic trailing commas
+skip-magic-trailing-comma = false
+
+# Include jupyter notebook cells
+ipynb = false
+
+# Color output when run from a terminal
+color = true
+
+# Preserve function annotations as needed
+skip-annotations = false
+
+# Handle numeric literals properly
+skip-numeric-underscore-normalization = false
+
+# Don't error on Python 2 code
+skip-errors = false
+
+# Required for some cases when you need to disable formatting
+# force-exclude = false
+
+# Don't reformat stubs (.pyi files)
+# skip-pyi = false
+
+# Additional configuration options below that may be useful:
+
+# Number of characters that will cause Black to split a collection's items across lines
+# The default is `None`, which means to follow the `line-length` setting.
+# This setting does not apply to strings, which are handled differently.
+# **This is an experimental option**
+# split-at = 88
+
+# Whether to keep the quotes of forward references.
+# A forward reference is when you reference a type hint in a string.
+# **This is an experimental option**
+# skip-fstring-quoting = true
+
+# Whether to normalize string quotes to use double quotes.
+# **This is an experimental option**
+# string-normalization = true

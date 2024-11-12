@@ -1,0 +1,63 @@
+# .pylintrc
+[MASTER]
+ignore=CVS,.git,venv,.venv,env,build,dist,__pycache__
+ignore-patterns=
+ignore-paths=
+    ./venv/*,
+    ./.venv/*,
+    ./env/*,
+    ./build/*,
+    ./dist/*,
+    ./*.egg-info/*
+
+# .flake8
+[flake8]
+exclude = 
+    .git,
+    __pycache__,
+    build,
+    dist,
+    venv,
+    .venv,
+    env,
+    *.egg-info
+max-line-length = 120
+extend-ignore = E203
+
+# .python-black
+# The previous content plus:
+extend-exclude = '''
+# Exclude common virtual environment names and build artifacts
+(
+    \.eggs
+    | \.git
+    | \.hg
+    | \.mypy_cache
+    | \.nox
+    | \.tox
+    | \.venv
+    | venv
+    | env
+    | _build
+    | buck-out
+    | build
+    | dist
+    | __pycache__
+)
+'''
+
+# Optional: Create a .gitignore if you haven't already
+.git/
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.coverage
+.pytest_cache/
+.idea/
+.vscode/

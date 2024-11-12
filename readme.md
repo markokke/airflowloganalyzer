@@ -1,15 +1,13 @@
-# README.md
 # Airflow Log Analyzer
 
 An AI-powered tool for analyzing Apache Airflow logs using Ollama models.
 
 ## Installation
-
 ```bash
 pip install -r requirements.txt
 ```
 
-### Mongo DB Index 
+### Mongo DB Index
 ```bash
 db.DagTaskLogs.createIndex(
   { "LogInfo": "text" },
@@ -25,6 +23,7 @@ db.DagTaskLogs.createIndex(
   }
 )
 ```
+
 ## Usage
 
 ```bash
@@ -47,11 +46,10 @@ Edit `config.yaml` to customize:
 - `prompts/`: Model prompt templates
 
 
-# Log Analysis Technology Enhancement Options
+## Log Analysis Technology Enhancement Options
 
-## Langchain Benefits
+### Langchain Benefits
 
-### Key Features
 - **Memory Management**
   - Maintain conversation history about specific error patterns
   - Enable follow-up analysis on patterns
@@ -70,14 +68,12 @@ Edit `config.yaml` to customize:
       >> recommendation_generator
   )
   ```
-  
 - **Structured Output Parsing**
   - Enforce strict typing on Ollama's responses
   - Ensure consistent report formatting
 
 ## LangGraph Benefits
 
-### Key Features
 - **Parallel Processing**
   - Analyze different log patterns concurrently
   
@@ -94,7 +90,7 @@ Edit `config.yaml` to customize:
       if needs_historical_context():
           historical = query_vector_db()
       return combine_analyses()
-  ```
+
   
 - **State Management**
   - Track analysis state
@@ -102,7 +98,6 @@ Edit `config.yaml` to customize:
 
 ## Chroma Vector Database Benefits
 
-### Key Features
 - **Historical Pattern Recognition**
   - Store historical log patterns and their analyses
   
@@ -156,7 +151,7 @@ async def enhanced_analysis():
     ])
     
     return await analysis_graph.execute()
-```
+  ```
 
 ## Current Usage Considerations
 
